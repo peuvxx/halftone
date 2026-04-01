@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>HALFTONE</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #000; overflow: hidden; cursor: none; }
+  #container { position: relative; width: 100vw; height: 100vh; }
+  #video { position: absolute; opacity: 0; pointer-events: none; width: 1px; height: 1px; }
+  #bgCanvas, #mainCanvas {
+    position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+  }
+  #offCanvas { display: none; }
+  #loading {
+    position: absolute; top: 50%; left: 50%;
+    transform: translate(-50%,-50%);
+    color: #ff28b4; font-family: 'Courier New', monospace;
+    font-size: 13px; letter-spacing: 0.4em; text-transform: uppercase;
+    animation: blink 1.2s ease-in-out infinite; z-index: 20;
+  }
+  @keyframes blink { 0%,100%{opacity:0.3} 50%{opacity:1} }
+</style>
+</head>
+<body>
+<div id="container">
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="bgCanvas"></canvas>
+  <canvas id="mainCanvas"></canvas>
+  <canvas id="offCanvas"></canvas>
+  <div id="loading">LOADING...</div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+<script>
+const video      = document.getElementById('video');
+const bgCanvas   = document.getElementById('bgCanvas');
+const mainCanvas = document.getElementById('mainCanvas');
+const offCanvas  = document.getElementById('offCanvas');
+const bgCtx  = bgCanvas.getContext('2d');
+const ctx    = mainCanvas.getContext('2d');
+const offCtx = offCanvas.getContext('2d');
+const loadingEl = document.getElementById('loading');
+
+// ── 리사이즈 ──────────────────────────────────────────────────
+function resize() {
+  const W = window.innerWidth, H = window.innerHeight;
+  bgCanvas.width = mainCanvas.width = W;
+  bgCanvas.height = mainCanvas.height = H;
+  offCanvas.width = W; offCanvas.height = H;
+}
+resize();
+window.addEventListener('resize', resize);
+
+// ── 배경: 카메라(완전불투명) + 핑크 도트 ─────────────────────
+function drawBackground() {
+  const W = bgCanvas.width, H = bgCanvas.height;
+  bgCtx.clearRect(0, 0, W, H);
+  bgCtx.save();
+  bgCtx.translate(W, 0);
+  bgCtx.scale(-1, 1);
+  bgCtx.drawImage(video, 0, 0, W, H);
+  bgCtx.restore();
+
+  // 십자(+) 그리드 — 레퍼런스 이미지 스타일
+  const gap = 22;
+  const arm = 3.5;
+  bgCtx.strokeStyle = 'rgba(255, 30, 170, 0.28)';
+  bgCtx.lineWidth = 1.0;
+  bgCtx.lineCap = 'round';
+  for (let x = gap; x < W; x += gap) {
+    for (let y = gap; y < H; y += gap) {
+      bgCtx.beginPath();
+      bgCtx.moveTo(x - arm, y); bgCtx.lineTo(x + arm, y); bgCtx.stroke();
+      bgCtx.beginPath();
+      bgCtx.moveTo(x, y - arm); bgCtx.lineTo(x, y + arm); bgCtx.stroke();
+    }
+  }
+}
+
+// ── 열화상 컬러맵 (보간) ──────────────────────────────────────
+function thermalColor(lum) {
+  const stops = [
+    [0.00, [8,   8,   8  ]],
+    [0.18, [90,  0,   50 ]],
+    [0.35, [210, 10,  130]],
+    [0.52, [255, 40,  170]],
+    [0.68, [255, 200, 0  ]],
+    [0.82, [160, 255, 0  ]],
+    [1.00, [210, 255, 80 ]],
+  ];
+  for (let i = 0; i < stops.length - 1; i++) {
+    const [t0, c0] = stops[i];
+    const [t1, c1] = stops[i+1];
+    if (lum >= t0 && lum <= t1) {
+      const f = (lum - t0) / (t1 - t0);
+      return c0.map((v, j) => Math.round(v + (c1[j] - v) * f));
+    }
+  }
+  return stops[stops.length-1][1];
+}
+
+// ── 도형 그리기: 0=원, 1=사각형, 2=다이아몬드, 3=링 ─────────
+function drawShape(cx, cy, r, type, rgb) {
+  const [red, grn, blu] = rgb;
+  ctx.fillStyle   = `rgb(${red},${grn},${blu})`;
+  ctx.strokeStyle = `rgb(${red},${grn},${blu})`;
+  if (type === 0) {
+    ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI*2); ctx.fill();
+  } else if (type === 1) {
+    ctx.fillRect(cx - r*0.9, cy - r*0.9, r*1.8, r*1.8);
+  } else if (type === 2) {
+    ctx.beginPath();
+    ctx.moveTo(cx, cy-r); ctx.lineTo(cx+r, cy);
+    ctx.lineTo(cx, cy+r); ctx.lineTo(cx-r, cy);
+    ctx.closePath(); ctx.fill();
+  } else {
+    ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI*2);
+    ctx.lineWidth = Math.max(1, r*0.38); ctx.stroke();
+  }
+}
+
+// ── 하프톤 도형 그리기 (베이스 레이어) ─────────────────────
+function drawHalftoneBase(pix, bw, bh, minX, minY, maxX, maxY) {
+  const GRID = 11;
+  for (let gy = minY; gy < maxY; gy += GRID) {
+    for (let gx = minX; gx < maxX; gx += GRID) {
+      const cx2 = gx + GRID/2, cy2 = gy + GRID/2;
+      let rS=0, gS=0, bS=0, n=0;
+      for (let sy=-1; sy<=1; sy++) for (let sx=-1; sx<=1; sx++) {
+        const px=Math.min(bw-1,Math.max(0,Math.round(cx2-minX+sx)));
+        const py=Math.min(bh-1,Math.max(0,Math.round(cy2-minY+sy)));
+        const idx=(py*bw+px)*4;
+        rS+=pix[idx]; gS+=pix[idx+1]; bS+=pix[idx+2]; n++;
+      }
+      const lum=(0.299*(rS/n)+0.587*(gS/n)+0.114*(bS/n))/255;
+      const dotR=(1-lum)*(GRID*0.52);
+      if (dotR<0.5) continue;
+      const col=thermalColor(lum);
+      const shape = lum>0.74?2:lum>0.50?3:lum>0.27?0:1;
+      drawShape(cx2, cy2, dotR, shape, col);
+    }
+  }
+}
+
+// ── 바이너리 텍스트 오버레이 (안정적 — 프레임마다 안 바뀜) ──
+// 각 셀의 비트값을 고정 (위치 해시 기반)
+function cellBit(col, row) {
+  // 간단한 해시: 위치 기반 고정값
+  const h = (col * 1664525 + row * 1013904223) & 0x7fffffff;
+  return h % 2;
+}
+
+function drawBinaryOverlay(pix, bw, bh, minX, minY, maxX, maxY) {
+  const CELL = 11;
+  const cols = Math.floor(bw / CELL);
+  const rows = Math.floor(bh / CELL);
+
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+
+  for (let row = 0; row < rows; row++) {
+    for (let col = 0; col < cols; col++) {
+      const sx = col * CELL + CELL/2;
+      const sy = row * CELL + CELL/2;
+      const px = Math.min(bw-1, Math.round(sx));
+      const py = Math.min(bh-1, Math.round(sy));
+      const idx = (py*bw+px)*4;
+      const lum = (0.299*pix[idx] + 0.587*pix[idx+1] + 0.114*pix[idx+2]) / 255;
+
+      // S커브로 대비 강화: 중간값을 양극으로 밀어냄
+      const c2 = lum < 0.5
+        ? 2 * lum * lum
+        : 1 - Math.pow(-2*lum+2, 2)/2;
+      const dark = 1 - c2;
+
+      // 어두운 영역에서만 글자 표시 (밝은 배경엔 생략)
+      if (dark < 0.3) continue;
+
+      const fontSize = Math.round(3 + dark * CELL * 0.85);
+      const alpha = 0.25 + dark * 0.65;
+      const bit = cellBit(col, row);
+
+      ctx.fillStyle = `rgba(0,0,0,${alpha})`;
+      ctx.font = `bold ${fontSize}px 'Courier New', monospace`;
+      ctx.fillText(bit, minX + sx, minY + sy);
+    }
+  }
+}
+
+// ── 메인 박스 렌더 ───────────────────────────────────────────
+function renderHalftone(c) {
+  const W = mainCanvas.width, H = mainCanvas.height;
+
+  // 미러된 카메라 오프스크린
+  offCtx.save();
+  offCtx.translate(W, 0); offCtx.scale(-1, 1);
+  offCtx.drawImage(video, 0, 0, W, H);
+  offCtx.restore();
+
+  ctx.save();
+
+  // 클리핑 + 핑크 베이스
+  ctx.beginPath();
+  ctx.moveTo(c.lt.x, c.lt.y); ctx.lineTo(c.rt.x, c.rt.y);
+  ctx.lineTo(c.rb.x, c.rb.y); ctx.lineTo(c.lb.x, c.lb.y);
+  ctx.closePath();
+  ctx.fillStyle = '#ff28b4';
+  ctx.fill();
+  ctx.clip();
+
+  // 바운딩박스
+  const xs=[c.lt.x,c.rt.x,c.lb.x,c.rb.x], ys=[c.lt.y,c.rt.y,c.lb.y,c.rb.y];
+  const minX=Math.max(0,Math.floor(Math.min(...xs)));
+  const minY=Math.max(0,Math.floor(Math.min(...ys)));
+  const maxX=Math.min(W,Math.ceil(Math.max(...xs)));
+  const maxY=Math.min(H,Math.ceil(Math.max(...ys)));
+  const bw=maxX-minX, bh=maxY-minY;
+  if (bw<4||bh<4){ctx.restore();return;}
+
+  const imgData=offCtx.getImageData(minX,minY,bw,bh);
+  const pix=imgData.data;
+
+  // 1. 하프톤 도형 베이스
+  drawHalftoneBase(pix, bw, bh, minX, minY, maxX, maxY);
+
+  // 2. 바이너리 텍스트 오버레이 (어두운 영역 위에)
+  drawBinaryOverlay(pix, bw, bh, minX, minY, maxX, maxY);
+
+  ctx.restore();
+}
+
+// ── 박스 테두리 제거됨
+function drawBoxOutline(c) {}
+
+// ── 손 스켈레톤 ───────────────────────────────────────────────
+const CONN=[
+  [0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],
+  [0,9],[9,10],[10,11],[11,12],[0,13],[13,14],[14,15],[15,16],
+  [0,17],[17,18],[18,19],[19,20],[5,9],[9,13],[13,17],
+];
+function drawSkeleton(lm,W,H,lc,tc){
+  // x좌표 반전: 배경이 scaleX(-1)이므로 맞춰서 (1-x)*W 사용
+  const mx=p=>((1-p.x)*W);
+  const my=p=>(p.y*H);
+  ctx.save(); ctx.strokeStyle=lc; ctx.lineWidth=1.2;
+  CONN.forEach(([a,b])=>{
+    ctx.beginPath();
+    ctx.moveTo(mx(lm[a]),my(lm[a])); ctx.lineTo(mx(lm[b]),my(lm[b])); ctx.stroke();
+  });
+  lm.forEach((p,i)=>{
+    const tip=[4,8,12,16,20].includes(i);
+    ctx.beginPath(); ctx.arc(mx(p),my(p),tip?5:2.5,0,Math.PI*2);
+    ctx.fillStyle=tip?tc:lc; ctx.fill();
+  });
+  ctx.restore();
+}
+
+// ── Idle: 아무것도 표시 안 함 ────────────────────────────────
+function drawIdle(){}
+
+// ── 상태 ──────────────────────────────────────────────────────
+let rawCorners=null, smoothCorners=null;
+const SMOOTH=0.12, lerp=(a,b,t)=>({x:a.x+(b.x-a.x)*t,y:a.y+(b.y-a.y)*t});
+let hasHands=false, currentLandmarks=[];
+
+// ── 메인 루프 ─────────────────────────────────────────────────
+function render(){
+  requestAnimationFrame(render);
+  const W=mainCanvas.width,H=mainCanvas.height;
+  drawBackground(); ctx.clearRect(0,0,W,H);
+  if(rawCorners){
+    if(!smoothCorners){smoothCorners={...rawCorners};}
+    else smoothCorners={
+      lt:lerp(smoothCorners.lt,rawCorners.lt,SMOOTH),
+      rt:lerp(smoothCorners.rt,rawCorners.rt,SMOOTH),
+      lb:lerp(smoothCorners.lb,rawCorners.lb,SMOOTH),
+      rb:lerp(smoothCorners.rb,rawCorners.rb,SMOOTH),
+    };
+  }
+  if(hasHands&&smoothCorners){renderHalftone(smoothCorners);}
+  else drawIdle();
+  currentLandmarks.forEach((lm,hi)=>drawSkeleton(lm,W,H,
+    hi===0?'rgba(180,255,0,0.4)':'rgba(0,210,255,0.4)',
+    hi===0?'#c8ff00':'#00d2ff'));
+}
+requestAnimationFrame(render);
+
+// ── MediaPipe ─────────────────────────────────────────────────
+const handsDetector=new Hands({locateFile:f=>`https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`});
+handsDetector.setOptions({maxNumHands:2,modelComplexity:1,minDetectionConfidence:0.75,minTrackingConfidence:0.65});
+
+handsDetector.onResults((results)=>{
+  loadingEl.style.display='none';
+  const W=mainCanvas.width,H=mainCanvas.height;
+  if(!results.multiHandLandmarks||results.multiHandLandmarks.length===0){
+    hasHands=false; rawCorners=null; currentLandmarks=[]; return;
+  }
+  currentLandmarks=results.multiHandLandmarks;
+
+  if(results.multiHandLandmarks.length===2){
+    const lm0=results.multiHandLandmarks[0];
+    const lm1=results.multiHandLandmarks[1];
+
+    // ── 핵심 수정: 화면은 좌우반전 상태 ──────────────────────
+    // MediaPipe x: 0=카메라 왼쪽=화면 오른쪽, 1=카메라 오른쪽=화면 왼쪽
+    // → x값이 클수록 화면 왼쪽
+    // 손목(0) x로 화면 기준 좌우 판별
+    const wrist0x=lm0[0].x, wrist1x=lm1[0].x;
+    // x 큰 쪽 = 화면 왼쪽 손
+    const sL = wrist0x < wrist1x ? lm0 : lm1;  // 화면 왼쪽 (x작은쪽=미러후 왼쪽)
+    const sR = wrist0x < wrist1x ? lm1 : lm0;  // 화면 오른쪽
+
+    // 왼손 검지(8)=좌상, 엄지(4)=좌하
+    // 오른손 검지(8)=우상, 엄지(4)=우하
+    rawCorners={
+      lt:{x:(1-sL[8].x)*W, y:sL[8].y*H},
+      rt:{x:(1-sR[8].x)*W, y:sR[8].y*H},
+      lb:{x:(1-sL[4].x)*W, y:sL[4].y*H},
+      rb:{x:(1-sR[4].x)*W, y:sR[4].y*H},
+    };
+    hasHands=true;
+
+  } else {
+    // 한 손: 엄지(4)↔검지(8) 대각선 박스
+    const lm=results.multiHandLandmarks[0];
+    const th={x:(1-lm[4].x)*W,y:lm[4].y*H}, ix={x:(1-lm[8].x)*W,y:lm[8].y*H};
+    rawCorners={
+      lt:{x:Math.min(th.x,ix.x),y:Math.min(th.y,ix.y)},
+      rt:{x:Math.max(th.x,ix.x),y:Math.min(th.y,ix.y)},
+      lb:{x:Math.min(th.x,ix.x),y:Math.max(th.y,ix.y)},
+      rb:{x:Math.max(th.x,ix.x),y:Math.max(th.y,ix.y)},
+    };
+    hasHands=true;
+  }
+});
+
+// ── 카메라 ────────────────────────────────────────────────────
+const camera=new Camera(video,{
+  onFrame:async()=>{await handsDetector.send({image:video});},
+  width:1920,height:1080,
+});
+camera.start().catch(()=>{loadingEl.textContent='CAMERA ACCESS REQUIRED';});
+</script>
+</body>
+</html>
