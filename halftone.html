@@ -303,7 +303,7 @@ handsDetector.onResults((results)=>{
     const lm0=results.multiHandLandmarks[0];
     const lm1=results.multiHandLandmarks[1];
 
-    // ── 핵심 수정: 화면은 좌우반전 상태 ──────────────────────
+    // ── 핵심 수정: 화면은 좌우반전 상태 ──
     // MediaPipe x: 0=카메라 왼쪽=화면 오른쪽, 1=카메라 오른쪽=화면 왼쪽
     // → x값이 클수록 화면 왼쪽
     // 손목(0) x로 화면 기준 좌우 판별
